@@ -15,7 +15,11 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 import pandas as pd
+import numpy as np
 from tqdm import tqdm
+
+from prompt_builder import build_tagging_prompt
+from batch_processor import normalize_requests, parse_llm_response
 
 # Отключаем предупреждения urllib3
 urllib3.disable_warnings()
@@ -106,51 +110,53 @@ class OllamaLLM:
                 f"Убедитесь что Ollama запущена: 'ollama serve'. Ошибка: {e}"
             )
     
+    def _extract_content(self, response: dict) -> str:
+        """
+        Извлечь контент из ответа Ollama API.
+        
+        Args:
+            response: Ответ от API Ollama
+            
+        Returns:
+            Текст контента
+        """
+        return response.get("message", {}).get("content", "").strip()
+    
     def tag_batch(
         self,
-        requests: list[str],
+        requests: list[tuple[str, str]] | list[dict],
         prompt: str,
         existing_tags: Optional[dict[str, str]] = None,
         max_tags: int = 5
-    ) -> list[dict]:
+    ) -> tuple[list[dict], dict[str, str]]:
         """
         Тегировать батч обращений.
         
         Args:
-            requests: Список текстов обращений
+            requests: Список обращений в формате [(id, text), ...] или [{"id": id, "text": text}, ...]
             prompt: Промпт с инструкциями по тегированию
             existing_tags: Существующие теги {tag_name: description}
             max_tags: Максимальное количество тегов на обращение
             
         Returns:
-            Список словарей с тегами для каждого обращения
-            Формат: [{"tags": ["тег1", "тег2"], "descriptions": {"тег1": "описание1", ...}}, ...]
+            Кортеж (список результатов с id и тегами, словарь новых тегов)
+            Формат: (
+                [{"id": "id1", "tags": ["тег1", "тег2"]}, ...],
+                {"новый_тег1": "описание1", "новый_тег2": "описание2", ...}
+            )
         """
-        # Формируем промпт с существующими тегами
-        existing_tags_text = ""
-        if existing_tags:
-            existing_tags_text = "\n\nСуществующие теги (используй их если подходят):\n"
-            for tag_name, description in existing_tags.items():
-                existing_tags_text += f"- {tag_name}: {description}\n"
+        # Нормализуем формат запросов
+        normalized_requests = normalize_requests(requests)
         
-        # Формируем список обращений
-        requests_text = "\n".join([f"{i+1}. {req}" for i, req in enumerate(requests)])
+        # Формируем промпт
+        full_prompt = build_tagging_prompt(
+            base_prompt=prompt,
+            requests=normalized_requests,
+            existing_tags=existing_tags,
+            max_tags=max_tags
+        )
         
-        # Полный промпт
-        full_prompt = f"""{prompt}
-
-{existing_tags_text}
-
-Обращения для тегирования:
-{requests_text}
-
-Верни JSON массив, где для каждого обращения указаны теги и их описания.
-Формат: [{{"tags": ["тег1", "тег2"], "descriptions": {{"тег1": "описание1", "тег2": "описание2"}}}}, ...]
-Максимум {max_tags} тегов на обращение.
-Если тег определить невозможно, верни {{"tags": [], "descriptions": {{}}}}.
-"""
-        
-        # Запрос к LLM
+        # Запрос к LLM (специфичный для Ollama)
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": full_prompt}],
@@ -158,42 +164,15 @@ class OllamaLLM:
             "format": "json",
             "options": {
                 "temperature": self.temperature,
-                "num_predict": 4096,
+                "num_predict": 8192,
             },
         }
         
         response = self._make_request("chat", payload)
-        content = response.get("message", {}).get("content", "").strip()
+        content = self._extract_content(response)
         
-        try:
-            result = json.loads(content)
-            
-            # Если результат - словарь, пытаемся извлечь массив из него
-            if isinstance(result, dict):
-                # Ищем массив в различных возможных ключах
-                for key in ["issues", "results", "items", "data", "tags", "responses", "requests"]:
-                    if key in result and isinstance(result[key], list):
-                        result = result[key]
-                        break
-                else:
-                    # Если не нашли массив, оборачиваем словарь в список
-                    result = [result]
-            
-            # Проверяем что результат - список
-            if not isinstance(result, list):
-                result = [result]
-            
-            # Дополняем до нужного количества если LLM вернул меньше
-            while len(result) < len(requests):
-                result.append({"tags": [], "descriptions": {}})
-            
-            return result[:len(requests)]
-            
-        except json.JSONDecodeError as e:
-            # Если не удалось распарсить JSON, возвращаем пустые теги
-            print(f"[ERROR] Failed to parse JSON: {e}")
-            print(f"[ERROR] Content was: {content[:200]}...")
-            return [{"tags": [], "descriptions": {}} for _ in requests]
+        # Парсим ответ
+        return parse_llm_response(content, normalized_requests)
 
 
 class OpenAICompatibleLLM:
@@ -312,51 +291,53 @@ class OpenAICompatibleLLM:
                 f"Не удалось подключиться к API на {self.api_url}. Ошибка: {e}"
             )
     
+    def _extract_content(self, response: dict) -> str:
+        """
+        Извлечь контент из ответа OpenAI-совместимого API.
+        
+        Args:
+            response: Ответ от API
+            
+        Returns:
+            Текст контента
+        """
+        return response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    
     def tag_batch(
         self,
-        requests: list[str],
+        requests: list[tuple[str, str]] | list[dict],
         prompt: str,
         existing_tags: Optional[dict[str, str]] = None,
         max_tags: int = 5
-    ) -> list[dict]:
+    ) -> tuple[list[dict], dict[str, str]]:
         """
         Тегировать батч обращений.
         
         Args:
-            requests: Список текстов обращений
+            requests: Список обращений в формате [(id, text), ...] или [{"id": id, "text": text}, ...]
             prompt: Промпт с инструкциями по тегированию
             existing_tags: Существующие теги {tag_name: description}
             max_tags: Максимальное количество тегов на обращение
             
         Returns:
-            Список словарей с тегами для каждого обращения
-            Формат: [{"tags": ["тег1", "тег2"], "descriptions": {"тег1": "описание1", ...}}, ...]
+            Кортеж (список результатов с id и тегами, словарь новых тегов)
+            Формат: (
+                [{"id": "id1", "tags": ["тег1", "тег2"]}, ...],
+                {"новый_тег1": "описание1", "новый_тег2": "описание2", ...}
+            )
         """
-        # Формируем промпт с существующими тегами
-        existing_tags_text = ""
-        if existing_tags:
-            existing_tags_text = "\n\nСуществующие теги (используй их если подходят):\n"
-            for tag_name, description in existing_tags.items():
-                existing_tags_text += f"- {tag_name}: {description}\n"
+        # Нормализуем формат запросов
+        normalized_requests = normalize_requests(requests)
         
-        # Формируем список обращений
-        requests_text = "\n".join([f"{i+1}. {req}" for i, req in enumerate(requests)])
+        # Формируем промпт
+        full_prompt = build_tagging_prompt(
+            base_prompt=prompt,
+            requests=normalized_requests,
+            existing_tags=existing_tags,
+            max_tags=max_tags
+        )
         
-        # Полный промпт
-        full_prompt = f"""{prompt}
-
-{existing_tags_text}
-
-Обращения для тегирования:
-{requests_text}
-
-Верни JSON массив, где для каждого обращения указаны теги и их описания.
-Формат: [{{"tags": ["тег1", "тег2"], "descriptions": {{"тег1": "описание1", "тег2": "описание2"}}}}, ...]
-Максимум {max_tags} тегов на обращение.
-Если тег определить невозможно, верни {{"tags": [], "descriptions": {{}}}}.
-"""
-        
-        # Запрос к LLM (OpenAI API формат)
+        # Запрос к LLM (специфичный для OpenAI API)
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": full_prompt}],
@@ -369,37 +350,10 @@ class OpenAICompatibleLLM:
         }
         
         response = self._make_request("chat/completions", payload)
-        content = response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        content = self._extract_content(response)
         
-        try:
-            result = json.loads(content)
-            
-            # Если результат - словарь, пытаемся извлечь массив из него
-            if isinstance(result, dict):
-                # Ищем массив в различных возможных ключах
-                for key in ["issues", "results", "items", "data", "tags", "responses", "requests"]:
-                    if key in result and isinstance(result[key], list):
-                        result = result[key]
-                        break
-                else:
-                    # Если не нашли массив, оборачиваем словарь в список
-                    result = [result]
-            
-            # Проверяем что результат - список
-            if not isinstance(result, list):
-                result = [result]
-            
-            # Дополняем до нужного количества если LLM вернул меньше
-            while len(result) < len(requests):
-                result.append({"tags": [], "descriptions": {}})
-            
-            return result[:len(requests)]
-            
-        except json.JSONDecodeError as e:
-            # Если не удалось распарсить JSON, возвращаем пустые теги
-            print(f"[ERROR] Failed to parse JSON: {e}")
-            print(f"[ERROR] Content was: {content[:200]}...")
-            return [{"tags": [], "descriptions": {}} for _ in requests]
+        # Парсим ответ
+        return parse_llm_response(content, normalized_requests)
 
 
 class TaggingPipeline:
@@ -410,13 +364,13 @@ class TaggingPipeline:
     - Батчинг (30-100 обращений)
     - Многопоточность (5 параллельных запросов)
     - Фильтрацию по количеству существующих тегов
+    - Автоматическое накопление тегов между батчами
     """
     
     def __init__(
         self,
         llm = None,
         batch_size: int = 50,
-        num_workers: int = 5
     ):
         """
         Инициализация pipeline.
@@ -425,10 +379,11 @@ class TaggingPipeline:
             llm: Экземпляр OllamaLLM или OpenAICompatibleLLM (если None, создается OllamaLLM по умолчанию)
             batch_size: Размер батча обращений (по умолчанию 50)
             num_workers: Количество параллельных потоков (по умолчанию 5)
+                - num_workers=1: последовательная обработка, каждый батч видит теги предыдущих (медленнее, но консистентнее)
+                - num_workers>1: параллельная обработка (быстрее, но возможны похожие теги из разных батчей)
         """
         self.llm = llm or OllamaLLM()
         self.batch_size = batch_size
-        self.num_workers = num_workers
         
     def _count_tags(self, tags_str: str) -> int:
         """
@@ -448,51 +403,68 @@ class TaggingPipeline:
         self,
         batch_df: pd.DataFrame,
         text_column: str,
+        id_column: Optional[str],
         tag_prompt: str,
         existing_tags: Optional[dict[str, str]],
         max_tags: int
-    ) -> tuple[list[str], dict[str, str]]:
+    ) -> tuple[dict[str, str], dict[str, str]]:
         """
         Обработать один батч обращений.
         
         Args:
             batch_df: DataFrame с батчем обращений
             text_column: Название колонки с текстом
+            id_column: Название колонки с ID (если None, используется индекс)
             tag_prompt: Промпт для тегирования
             existing_tags: Существующие теги
             max_tags: Максимальное количество тегов
             
         Returns:
-            Кортеж (список тегов для каждой строки, обновленный словарь тегов)
+            Кортеж (словарь {id: tags_string}, обновленный словарь тегов с новыми тегами)
         """
-        requests = batch_df[text_column].tolist()
+        # Формируем список кортежей (id, text) для передачи в tag_batch
+        requests_with_ids = []
+        id_to_idx = {}  # Маппинг id -> индекс в batch_df
         
-        # Получаем теги от LLM
-        results = self.llm.tag_batch(
-            requests=requests,
+        for idx, row in batch_df.iterrows():
+            if id_column and id_column in batch_df.columns:
+                req_id = str(row[id_column])
+            else:
+                req_id = str(idx)
+            
+            req_text = str(row[text_column])
+            requests_with_ids.append((req_id, req_text))
+            id_to_idx[req_id] = idx
+        
+        # Получаем теги от LLM (новый формат: кортеж из results и new_tags)
+        results, new_tags = self.llm.tag_batch(
+            requests=requests_with_ids,
             prompt=tag_prompt,
             existing_tags=existing_tags,
             max_tags=max_tags
         )
         
-        # Формируем результаты
-        tags_list = []
-        new_tags_dict = existing_tags.copy() if existing_tags else {}
+        # Формируем результаты: словарь {id: tags_string}
+        tags_dict = {}
+        updated_tags_dict = existing_tags.copy() if existing_tags else {}
         
+        # Добавляем новые теги в словарь
+        updated_tags_dict.update(new_tags)
+        
+        # Обрабатываем результаты от LLM
         for result in results:
+            if not isinstance(result, dict):
+                continue
+            
+            req_id = result.get("id")
             tags = result.get("tags", [])
-            descriptions = result.get("descriptions", {})
             
-            # Обновляем словарь тегов
-            for tag in tags:
-                if tag and tag not in new_tags_dict:
-                    new_tags_dict[tag] = descriptions.get(tag, "")
-            
-            # Формируем строку с тегами
-            tags_str = ", ".join(tags) if tags else ""
-            tags_list.append(tags_str)
+            if req_id:
+                # Формируем строку с тегами
+                tags_str = ", ".join(tags) if tags else ""
+                tags_dict[req_id] = tags_str
         
-        return tags_list, new_tags_dict
+        return tags_dict, updated_tags_dict
     
     def tag(
         self,
@@ -502,7 +474,9 @@ class TaggingPipeline:
         id_column: Optional[str] = None,
         existing_tags: Optional[dict[str, str]] = None,
         skip_if_tags_count: int = 10,
-        max_tags: int = 5
+        max_tags: int = 5,
+        num_workers: int = 1,
+        batch_size: int = 50
     ) -> tuple[pd.DataFrame, dict[str, str]]:
         """
         Тегировать обращения в DataFrame.
@@ -515,6 +489,7 @@ class TaggingPipeline:
             existing_tags: Существующие теги {tag_name: description}
             skip_if_tags_count: Пропустить строки с количеством тегов >= этого значения
             max_tags: Максимальное количество тегов на обращение
+            num_workers: Количество параллельных потоков (по умолчанию None, используется self.num_workers)
             
         Returns:
             Кортеж (DataFrame с колонкой tags, словарь тегов {tag_name: description})
@@ -546,52 +521,354 @@ class TaggingPipeline:
         
         # Разбиваем на батчи
         batches = []
-        for i in range(0, len(to_process_df), self.batch_size):
-            batch = to_process_df.iloc[i:i+self.batch_size]
+        for i in range(0, len(to_process_df), batch_size):
+            batch = to_process_df.iloc[i:i+batch_size]
             batches.append(batch)
         
         print(f"Батчей для обработки: {len(batches)}")
         
-        # Обрабатываем батчи параллельно
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = {
-                executor.submit(
-                    self._process_batch,
-                    batch,
-                    text_column,
-                    tag_prompt,
-                    tags_dict,
-                    max_tags
-                ): i
-                for i, batch in enumerate(batches)
-            }
-            
-            batch_results = {}
-            with tqdm(total=len(batches), desc="Обработка батчей", unit="batch") as pbar:
-                for future in as_completed(futures):
-                    batch_idx = futures[future]
+        # Обрабатываем батчи с учетом num_workers
+        # num_workers=1: последовательная обработка, каждый батч видит теги предыдущих
+        # num_workers>1: параллельная обработка (до num_workers одновременно), каждый новый батч видит обновленные теги от завершенных батчей
+        batch_results = {}
+
+
+        if num_workers == 1:
+            # Последовательная обработка - каждый батч видит накопленные теги
+            print(f"[LOG] Последовательная обработка: {len(batches)} батчей, начальное количество тегов: {len(tags_dict)}")
+            with tqdm(total=len(batches), desc="Обработка батчей (последовательно)", unit="batch") as pbar:
+                for batch_idx, batch in enumerate(batches):
                     try:
-                        tags_list, new_tags_dict = future.result()
-                        batch_results[batch_idx] = (tags_list, new_tags_dict)
-                        tags_dict.update(new_tags_dict)
+                        tags_before = len(tags_dict)
+                        tags_before_keys = set(tags_dict.keys())
+                        print(f"[LOG] Запуск батча {batch_idx + 1}/{len(batches)} с {tags_before} тегами в словаре")
+                        
+                        # Каждый батч получает обновленный словарь тегов
+                        tags_dict_batch, updated_tags_dict = self._process_batch(
+                            batch,
+                            text_column,
+                            id_column,
+                            tag_prompt,
+                            tags_dict,  # Передаем текущий словарь тегов
+                            max_tags
+                        )
+                        
+                        # Определяем новые теги до обновления tags_dict
+                        new_tags_keys = set(updated_tags_dict.keys()) - tags_before_keys
+                        new_tags_count = len(new_tags_keys)
+                        
+                        # Обновляем словарь тегов для следующего батча
+                        tags_dict = updated_tags_dict
+                        tags_after = len(tags_dict)
+                        
+                        if new_tags_count > 0:
+                            new_tags_list = list(new_tags_keys)[:5]
+                            new_tags_str = ", ".join(new_tags_list)
+                            if new_tags_count > 5:
+                                new_tags_str += f" ... (+{new_tags_count - 5} еще)"
+                            print(f"[LOG] Батч {batch_idx + 1} завершен: добавлено {new_tags_count} новых тегов ({tags_before} -> {tags_after}): {new_tags_str}")
+                        else:
+                            print(f"[LOG] Батч {batch_idx + 1} завершен: новых тегов нет ({tags_before} -> {tags_after})")
+                        
+                        batch_results[batch_idx] = (tags_dict_batch, updated_tags_dict)
+                        
                         pbar.update(1)
-                        pbar.set_postfix({"последний батч": batch_idx + 1})
+                        pbar.set_postfix({
+                            "батч": batch_idx + 1,
+                            "тегов": len(tags_dict)
+                        })
                     except Exception as e:
-                        print(f"\nОшибка в батче {batch_idx + 1}: {e}")
-                        batch_results[batch_idx] = ([""] * len(batches[batch_idx]), {})
+                        print(f"\n[ERROR] Ошибка в батче {batch_idx + 1}: {e}")
+                        batch_results[batch_idx] = ({}, tags_dict.copy())
                         pbar.update(1)
+            print(f"[LOG] Последовательная обработка завершена: итоговое количество тегов: {len(tags_dict)}")
+        else:
+            # Параллельная обработка с последовательным обновлением tags_dict
+            # Запускаем батчи последовательно, но одновременно может работать до num_workers батчей
+            # Каждый новый батч видит обновленный tags_dict от завершенных батчей
+            print(f"[LOG] Параллельная обработка: {len(batches)} батчей, max_workers={num_workers}, начальное количество тегов: {len(tags_dict)}")
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {}
+                completed_count = 0
+                
+                def submit_next_batch(batch_idx):
+                    """Запустить следующий батч с текущим tags_dict"""
+                    # Создаем копию текущего словаря тегов для этого батча
+                    current_tags = tags_dict.copy()
+                    tags_count = len(current_tags)
+                    print(f"[LOG] Запуск батча {batch_idx + 1}/{len(batches)} с {tags_count} тегами в словаре")
+                    return executor.submit(
+                        self._process_batch,
+                        batches[batch_idx],
+                        text_column,
+                        id_column,
+                        tag_prompt,
+                        current_tags,  # Каждый батч получает актуальный словарь тегов
+                        max_tags
+                    )
+                
+                # Запускаем первые num_workers батчей
+                print(f"[LOG] Параллельная обработка: запускаем первые {min(num_workers, len(batches))} батчей")
+                for i in range(min(num_workers, len(batches))):
+                    future = submit_next_batch(i)
+                    futures[future] = i
+                
+                next_batch_idx = num_workers
+                
+                with tqdm(total=len(batches), desc="Обработка батчей (параллельно с обновлением)", unit="batch") as pbar:
+                    while futures:
+                        # Ждем завершения любого батча
+                        done, not_done = [], []
+                        for future in futures:
+                            if future.done():
+                                done.append(future)
+                            else:
+                                not_done.append(future)
+                        
+                        # Обрабатываем завершенные батчи
+                        for future in done:
+                            batch_idx = futures[future]
+                            try:
+                                tags_dict_batch, updated_tags_dict = future.result()
+                                
+                                # Логируем до обновления
+                                tags_before = len(tags_dict)
+                                new_tags_count = len(updated_tags_dict)
+                                
+                                # Обновляем общий словарь тегов
+                                tags_dict.update(updated_tags_dict)
+                                
+                                # Логируем после обновления
+                                tags_after = len(tags_dict)
+                                if new_tags_count > 0:
+                                    new_tags_list = list(updated_tags_dict.keys())[:5]  # Показываем первые 5
+                                    new_tags_str = ", ".join(new_tags_list)
+                                    if new_tags_count > 5:
+                                        new_tags_str += f" ... (+{new_tags_count - 5} еще)"
+                                    print(f"[LOG] Батч {batch_idx + 1} завершен: добавлено {new_tags_count} новых тегов ({tags_before} -> {tags_after}): {new_tags_str}")
+                                else:
+                                    print(f"[LOG] Батч {batch_idx + 1} завершен: новых тегов нет ({tags_before} -> {tags_after})")
+                                
+                                batch_results[batch_idx] = (tags_dict_batch, updated_tags_dict)
+                                
+                                completed_count += 1
+                                pbar.update(1)
+                                pbar.set_postfix({
+                                    "батч": batch_idx + 1,
+                                    "тегов": len(tags_dict),
+                                    "активных": len(not_done)
+                                })
+                            except Exception as e:
+                                print(f"\n[ERROR] Ошибка в батче {batch_idx + 1}: {e}")
+                                batch_results[batch_idx] = ({}, tags_dict.copy())
+                                completed_count += 1
+                                pbar.update(1)
+                            
+                            # Удаляем завершенный батч из словаря
+                            del futures[future]
+                            
+                            # Запускаем следующий батч, если есть
+                            if next_batch_idx < len(batches):
+                                new_future = submit_next_batch(next_batch_idx)
+                                futures[new_future] = next_batch_idx
+                                next_batch_idx += 1
+                        
+                        # Если нет завершенных батчей, небольшая задержка
+                        if not done:
+                            import time
+                            time.sleep(0.1)
+            
+            print(f"[LOG] Параллельная обработка завершена: итоговое количество тегов: {len(tags_dict)}")
         
         # Применяем результаты к DataFrame
         for batch_idx in sorted(batch_results.keys()):
-            tags_list, _ = batch_results[batch_idx]
+            tags_dict_batch, _ = batch_results[batch_idx]
             batch = batches[batch_idx]
             
-            for (idx, row), tags_str in zip(batch.iterrows(), tags_list):
+            for idx, row in batch.iterrows():
+                # Определяем ID для этой строки
+                if id_column and id_column in batch.columns:
+                    req_id = str(row[id_column])
+                else:
+                    req_id = str(idx)
+                
+                # Получаем теги из словаря по ID
+                tags_str = tags_dict_batch.get(req_id, "")
                 result_df.at[idx, "tags"] = tags_str
         
         print(f"Обработка завершена. Всего тегов в словаре: {len(tags_dict)}")
         
         return result_df, tags_dict
+    
+    def expand_tags_to_columns(
+        self,
+        df: pd.DataFrame,
+        tags_column: str = "tags"
+    ) -> pd.DataFrame:
+        """
+        Раскидывает теги по отдельным столбцам.
+        
+        Для каждого уникального тега создается столбец tag_[name_of_tag] с булевыми значениями.
+        
+        Args:
+            df: DataFrame с колонкой tags
+            tags_column: Название колонки с тегами (по умолчанию "tags")
+            
+        Returns:
+            DataFrame с дополнительными столбцами tag_[name_of_tag]
+        """
+        result_df = df.copy()
+        
+        if tags_column not in result_df.columns:
+            raise ValueError(f"Колонка '{tags_column}' не найдена в DataFrame")
+        
+        # Собираем все уникальные теги
+        all_tags = set()
+        for tags_str in result_df[tags_column]:
+            if pd.notna(tags_str) and tags_str and str(tags_str).strip():
+                tags_list = [t.strip() for t in str(tags_str).split(",") if t.strip()]
+                all_tags.update(tags_list)
+        
+        # Создаем столбцы для каждого тега
+        for tag in all_tags:
+            # Нормализуем имя тега для столбца: заменяем пробелы и спецсимволы на подчеркивания
+            tag_normalized = tag.replace(" ", "_").replace("/", "_").replace("\\", "_")
+            tag_normalized = "".join(c if c.isalnum() or c == "_" else "_" for c in tag_normalized)
+            column_name = f"tag_{tag_normalized}"
+            
+            # Проверяем наличие тега в каждой строке
+            result_df[column_name] = result_df[tags_column].apply(
+                lambda x: tag in [t.strip() for t in str(x).split(",") if t.strip()] 
+                if pd.notna(x) and x and str(x).strip() else False
+            ).astype(bool)
+        
+        print(f"Создано {len(all_tags)} столбцов для тегов")
+        
+        return result_df
+    
+    def analyze_tags(
+        self,
+        df: pd.DataFrame,
+        tags_column: str = "tags"
+    ) -> dict:
+        """
+        Собирает статистику по тегам и выполняет корреляционный анализ.
+        
+        Args:
+            df: DataFrame с колонкой tags
+            tags_column: Название колонки с тегами (по умолчанию "tags")
+            
+        Returns:
+            Словарь с ключами:
+            - 'statistics': DataFrame со статистикой по каждому тегу (количество, процент)
+            - 'correlation': DataFrame с корреляционной матрицей тегов
+            - 'top_pairs': DataFrame с топ-10 парами тегов, которые чаще всего встречаются вместе
+        """
+        if tags_column not in df.columns:
+            raise ValueError(f"Колонка '{tags_column}' не найдена в DataFrame")
+        
+        # Собираем все уникальные теги и создаем маппинг нормализованное имя -> оригинальный тег
+        all_tags = set()
+        tag_to_normalized = {}
+        normalized_to_tag = {}
+        
+        for tags_str in df[tags_column]:
+            if pd.notna(tags_str) and tags_str and str(tags_str).strip():
+                tags_list = [t.strip() for t in str(tags_str).split(",") if t.strip()]
+                all_tags.update(tags_list)
+        
+        # Создаем маппинг
+        for tag in all_tags:
+            tag_normalized = tag.replace(" ", "_").replace("/", "_").replace("\\", "_")
+            tag_normalized = "".join(c if c.isalnum() or c == "_" else "_" for c in tag_normalized)
+            tag_to_normalized[tag] = tag_normalized
+            normalized_to_tag[tag_normalized] = tag
+        
+        if not all_tags:
+            return {
+                'statistics': pd.DataFrame(),
+                'correlation': pd.DataFrame(),
+                'top_pairs': pd.DataFrame()
+            }
+        
+        # Создаем бинарную матрицу тегов
+        tag_matrix = {}
+        for tag in all_tags:
+            tag_normalized = tag_to_normalized[tag]
+            tag_matrix[tag_normalized] = df[tags_column].apply(
+                lambda x: tag in [t.strip() for t in str(x).split(",") if t.strip()] 
+                if pd.notna(x) and x and str(x).strip() else False
+            ).astype(int)
+        
+        tag_data_df = pd.DataFrame(tag_matrix)
+        
+        # 1. Статистика по тегам
+        tag_stats = []
+        total_rows = len(df)
+        
+        for tag_normalized, tag_original in normalized_to_tag.items():
+            count = tag_data_df[tag_normalized].sum()
+            percentage = (count / total_rows * 100) if total_rows > 0 else 0
+            
+            tag_stats.append({
+                'tag': tag_original,
+                'count': count,
+                'percentage': round(percentage, 2)
+            })
+        
+        statistics_df = pd.DataFrame(tag_stats).sort_values('count', ascending=False)
+        
+        # 2. Корреляционный анализ
+        correlation_matrix = tag_data_df.corr()
+        # Переименовываем индексы и столбцы на оригинальные имена тегов
+        correlation_matrix.index = [normalized_to_tag.get(idx, idx) for idx in correlation_matrix.index]
+        correlation_matrix.columns = [normalized_to_tag.get(col, col) for col in correlation_matrix.columns]
+        
+        # 3. Топ пар тегов, которые встречаются вместе
+        pairs_data = []
+        tag_columns = list(tag_data_df.columns)
+        
+        for i, col1 in enumerate(tag_columns):
+            for col2 in tag_columns[i+1:]:
+                tag1 = normalized_to_tag.get(col1, col1)
+                tag2 = normalized_to_tag.get(col2, col2)
+                
+                # Количество строк, где оба тега присутствуют
+                both_count = ((tag_data_df[col1] == 1) & (tag_data_df[col2] == 1)).sum()
+                
+                # Количество строк с каждым тегом отдельно
+                tag1_count = tag_data_df[col1].sum()
+                tag2_count = tag_data_df[col2].sum()
+                
+                # Процент совместного появления от общего количества строк
+                both_percentage = (both_count / total_rows * 100) if total_rows > 0 else 0
+                
+                # Процент совместного появления от количества тега1
+                tag1_joint_percentage = (both_count / tag1_count * 100) if tag1_count > 0 else 0
+                
+                # Процент совместного появления от количества тега2
+                tag2_joint_percentage = (both_count / tag2_count * 100) if tag2_count > 0 else 0
+                
+                if both_count > 0:
+                    pairs_data.append({
+                        'tag1': tag1,
+                        'tag2': tag2,
+                        'both_count': both_count,
+                        'both_percentage': round(both_percentage, 2),
+                        'tag1_count': tag1_count,
+                        'tag2_count': tag2_count,
+                        'tag1_joint_percentage': round(tag1_joint_percentage, 2),
+                        'tag2_joint_percentage': round(tag2_joint_percentage, 2),
+                        'correlation': correlation_matrix.loc[tag1, tag2]
+                    })
+        
+        top_pairs_df = pd.DataFrame(pairs_data).sort_values('both_count', ascending=False).head(10)
+        
+        return {
+            'statistics': statistics_df,
+            'correlation': correlation_matrix,
+            'top_pairs': top_pairs_df
+        }
 
 
 # Пример использования (для тестирования)
