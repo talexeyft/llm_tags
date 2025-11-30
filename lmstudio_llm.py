@@ -175,6 +175,7 @@ class LMStudioLLM:
         prompt: str,
         existing_tags: Optional[dict[str, str]] = None,
         max_tags: int = 5,
+        allow_new_tags: bool = True,
         disable_thinking: Optional[bool] = None
     ) -> tuple[list[dict], dict[str, str]]:
         """
@@ -185,6 +186,7 @@ class LMStudioLLM:
             prompt: Промпт с инструкциями по тегированию
             existing_tags: Существующие теги {tag_name: description}
             max_tags: Максимальное количество тегов на обращение
+            allow_new_tags: Разрешить создание новых тегов (по умолчанию True)
             disable_thinking: Если True, добавляет "/nothink" в системный промпт для отключения размышлений.
                              Если None, используется значение из конструктора.
             
@@ -203,7 +205,8 @@ class LMStudioLLM:
             base_prompt=prompt,
             requests=normalized_requests,
             existing_tags=existing_tags,
-            max_tags=max_tags
+            max_tags=max_tags,
+            allow_new_tags=allow_new_tags
         )
         
         # Используем значение из параметра или из конструктора
