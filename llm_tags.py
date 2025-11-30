@@ -15,6 +15,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 import pandas as pd
+from tqdm import tqdm
 
 # Отключаем предупреждения urllib3
 urllib3.disable_warnings()
@@ -166,6 +167,18 @@ class OllamaLLM:
         
         try:
             result = json.loads(content)
+            
+            # Если результат - словарь, пытаемся извлечь массив из него
+            if isinstance(result, dict):
+                # Ищем массив в различных возможных ключах
+                for key in ["issues", "results", "items", "data", "tags", "responses", "requests"]:
+                    if key in result and isinstance(result[key], list):
+                        result = result[key]
+                        break
+                else:
+                    # Если не нашли массив, оборачиваем словарь в список
+                    result = [result]
+            
             # Проверяем что результат - список
             if not isinstance(result, list):
                 result = [result]
@@ -176,8 +189,216 @@ class OllamaLLM:
             
             return result[:len(requests)]
             
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
             # Если не удалось распарсить JSON, возвращаем пустые теги
+            print(f"[ERROR] Failed to parse JSON: {e}")
+            print(f"[ERROR] Content was: {content[:200]}...")
+            return [{"tags": [], "descriptions": {}} for _ in requests]
+
+
+class OpenAICompatibleLLM:
+    """
+    Класс для работы с OpenAI-совместимыми API (OpenAI, vLLM, LM Studio, etc).
+    
+    Поддерживает стандартный OpenAI API формат запросов.
+    """
+    
+    def __init__(
+        self,
+        api_url: str,
+        model: str,
+        api_key: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        top_p: float = 1.0,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0
+    ):
+        """
+        Инициализация OpenAI-совместимого LLM.
+        
+        Args:
+            api_url: URL API (например, "https://api.openai.com/v1" или "http://localhost:8000/v1")
+            model: Название модели (например, "gpt-4", "gpt-3.5-turbo")
+            api_key: API ключ (если требуется, по умолчанию None)
+            temperature: Температура генерации (по умолчанию 0.7)
+            max_tokens: Максимальное количество токенов в ответе (по умолчанию 4096)
+            top_p: Nucleus sampling параметр (по умолчанию 1.0)
+            frequency_penalty: Штраф за частоту повторений (по умолчанию 0.0)
+            presence_penalty: Штраф за присутствие токенов (по умолчанию 0.0)
+        """
+        self.api_url = api_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.top_p = top_p
+        self.frequency_penalty = frequency_penalty
+        self.presence_penalty = presence_penalty
+        
+    def _make_request(self, endpoint: str, payload: dict) -> dict:
+        """
+        Выполнить HTTP запрос к OpenAI-совместимому API.
+        
+        Args:
+            endpoint: Конечная точка API (например, "chat/completions")
+            payload: Данные запроса
+            
+        Returns:
+            Ответ от API в виде словаря
+        """
+        url = f"{self.api_url}/{endpoint}"
+        
+        # Парсим URL для urllib3
+        if url.startswith("https://"):
+            protocol = "https"
+            url = url[8:]
+        elif url.startswith("http://"):
+            protocol = "http"
+            url = url[7:]
+        else:
+            protocol = "https"
+        
+        host_port = url.split("/", 1)
+        host = host_port[0]
+        path = "/" + host_port[1] if len(host_port) > 1 else "/"
+        
+        if ":" in host:
+            host, port = host.split(":")
+            port = int(port)
+        else:
+            port = 443 if protocol == "https" else 80
+        
+        try:
+            if protocol == "https":
+                http = urllib3.PoolManager(
+                    num_pools=1,
+                    maxsize=1,
+                    timeout=urllib3.Timeout(connect=10, read=300),
+                    cert_reqs='CERT_NONE'
+                )
+            else:
+                http = urllib3.PoolManager(
+                    num_pools=1,
+                    maxsize=1,
+                    timeout=urllib3.Timeout(connect=10, read=300)
+                )
+            
+            headers = {
+                "Content-Type": "application/json",
+                "Connection": "close"
+            }
+            
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            
+            response = http.request(
+                "POST",
+                f"{protocol}://{host}:{port}{path}",
+                body=json.dumps(payload).encode("utf-8"),
+                headers=headers
+            )
+            
+            if response.status != 200:
+                error_text = response.data.decode("utf-8")
+                raise ConnectionError(
+                    f"API error: {response.status}. Response: {error_text}"
+                )
+            
+            return json.loads(response.data.decode("utf-8"))
+            
+        except Exception as e:
+            raise ConnectionError(
+                f"Не удалось подключиться к API на {self.api_url}. Ошибка: {e}"
+            )
+    
+    def tag_batch(
+        self,
+        requests: list[str],
+        prompt: str,
+        existing_tags: Optional[dict[str, str]] = None,
+        max_tags: int = 5
+    ) -> list[dict]:
+        """
+        Тегировать батч обращений.
+        
+        Args:
+            requests: Список текстов обращений
+            prompt: Промпт с инструкциями по тегированию
+            existing_tags: Существующие теги {tag_name: description}
+            max_tags: Максимальное количество тегов на обращение
+            
+        Returns:
+            Список словарей с тегами для каждого обращения
+            Формат: [{"tags": ["тег1", "тег2"], "descriptions": {"тег1": "описание1", ...}}, ...]
+        """
+        # Формируем промпт с существующими тегами
+        existing_tags_text = ""
+        if existing_tags:
+            existing_tags_text = "\n\nСуществующие теги (используй их если подходят):\n"
+            for tag_name, description in existing_tags.items():
+                existing_tags_text += f"- {tag_name}: {description}\n"
+        
+        # Формируем список обращений
+        requests_text = "\n".join([f"{i+1}. {req}" for i, req in enumerate(requests)])
+        
+        # Полный промпт
+        full_prompt = f"""{prompt}
+
+{existing_tags_text}
+
+Обращения для тегирования:
+{requests_text}
+
+Верни JSON массив, где для каждого обращения указаны теги и их описания.
+Формат: [{{"tags": ["тег1", "тег2"], "descriptions": {{"тег1": "описание1", "тег2": "описание2"}}}}, ...]
+Максимум {max_tags} тегов на обращение.
+Если тег определить невозможно, верни {{"tags": [], "descriptions": {{}}}}.
+"""
+        
+        # Запрос к LLM (OpenAI API формат)
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": full_prompt}],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": self.top_p,
+            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": self.presence_penalty,
+            "response_format": {"type": "json_object"}
+        }
+        
+        response = self._make_request("chat/completions", payload)
+        content = response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        
+        try:
+            result = json.loads(content)
+            
+            # Если результат - словарь, пытаемся извлечь массив из него
+            if isinstance(result, dict):
+                # Ищем массив в различных возможных ключах
+                for key in ["issues", "results", "items", "data", "tags", "responses", "requests"]:
+                    if key in result and isinstance(result[key], list):
+                        result = result[key]
+                        break
+                else:
+                    # Если не нашли массив, оборачиваем словарь в список
+                    result = [result]
+            
+            # Проверяем что результат - список
+            if not isinstance(result, list):
+                result = [result]
+            
+            # Дополняем до нужного количества если LLM вернул меньше
+            while len(result) < len(requests):
+                result.append({"tags": [], "descriptions": {}})
+            
+            return result[:len(requests)]
+            
+        except json.JSONDecodeError as e:
+            # Если не удалось распарсить JSON, возвращаем пустые теги
+            print(f"[ERROR] Failed to parse JSON: {e}")
+            print(f"[ERROR] Content was: {content[:200]}...")
             return [{"tags": [], "descriptions": {}} for _ in requests]
 
 
@@ -193,7 +414,7 @@ class TaggingPipeline:
     
     def __init__(
         self,
-        llm: Optional[OllamaLLM] = None,
+        llm = None,
         batch_size: int = 50,
         num_workers: int = 5
     ):
@@ -201,7 +422,7 @@ class TaggingPipeline:
         Инициализация pipeline.
         
         Args:
-            llm: Экземпляр OllamaLLM (если None, создается по умолчанию)
+            llm: Экземпляр OllamaLLM или OpenAICompatibleLLM (если None, создается OllamaLLM по умолчанию)
             batch_size: Размер батча обращений (по умолчанию 50)
             num_workers: Количество параллельных потоков (по умолчанию 5)
         """
@@ -346,16 +567,19 @@ class TaggingPipeline:
             }
             
             batch_results = {}
-            for future in as_completed(futures):
-                batch_idx = futures[future]
-                try:
-                    tags_list, new_tags_dict = future.result()
-                    batch_results[batch_idx] = (tags_list, new_tags_dict)
-                    tags_dict.update(new_tags_dict)
-                    print(f"Батч {batch_idx + 1}/{len(batches)} обработан")
-                except Exception as e:
-                    print(f"Ошибка в батче {batch_idx + 1}: {e}")
-                    batch_results[batch_idx] = ([""] * len(batches[batch_idx]), {})
+            with tqdm(total=len(batches), desc="Обработка батчей", unit="batch") as pbar:
+                for future in as_completed(futures):
+                    batch_idx = futures[future]
+                    try:
+                        tags_list, new_tags_dict = future.result()
+                        batch_results[batch_idx] = (tags_list, new_tags_dict)
+                        tags_dict.update(new_tags_dict)
+                        pbar.update(1)
+                        pbar.set_postfix({"последний батч": batch_idx + 1})
+                    except Exception as e:
+                        print(f"\nОшибка в батче {batch_idx + 1}: {e}")
+                        batch_results[batch_idx] = ([""] * len(batches[batch_idx]), {})
+                        pbar.update(1)
         
         # Применяем результаты к DataFrame
         for batch_idx in sorted(batch_results.keys()):
@@ -413,4 +637,45 @@ if __name__ == "__main__":
     print("\nСловарь тегов:")
     for tag, desc in tags_dict.items():
         print(f"  {tag}: {desc}")
+    
+    # Пример с OpenAI-совместимым API
+    print("\n" + "="*50)
+    print("Пример с OpenAI-совместимым API:")
+    print("="*50)
+    
+    # Инициализируем OpenAI-совместимую LLM модель
+    # Например, для OpenAI:
+    # openai_llm = OpenAICompatibleLLM(
+    #     api_url="https://api.openai.com/v1",
+    #     model="gpt-4",
+    #     api_key="your-api-key-here",
+    #     temperature=0.7
+    # )
+    
+    # Или для локального vLLM сервера:
+    # vllm_llm = OpenAICompatibleLLM(
+    #     api_url="http://localhost:8000/v1",
+    #     model="meta-llama/Llama-2-7b-chat-hf",
+    #     temperature=0.7
+    # )
+    
+    # Или для LM Studio:
+    # lmstudio_llm = OpenAICompatibleLLM(
+    #     api_url="http://localhost:1234/v1",
+    #     model="local-model",
+    #     temperature=0.7
+    # )
+    
+    # Создаем pipeline с OpenAI-совместимой моделью
+    # openai_pipeline = TaggingPipeline(llm=openai_llm)
+    
+    # Тегирование
+    # result_df, tags_dict = openai_pipeline.tag(
+    #     tags=test_df,
+    #     text_column="text",
+    #     tag_prompt=prompt,
+    #     max_tags=3
+    # )
+    
+    print("Примеры закомментированы. Раскомментируйте нужный вариант.")
 

@@ -10,6 +10,7 @@
 - 💾 **Кеширование** результатов для повторного прогона
 - 🔄 **Фильтрация** по количеству существующих тегов
 - 🤖 **Ollama** - использование локальных LLM моделей (qwen32b по умолчанию)
+- 🌐 **OpenAI API** - поддержка OpenAI и совместимых API (vLLM, LM Studio, и др.)
 - 📊 **Словарь тегов** с описаниями
 
 ## 📦 Установка
@@ -77,7 +78,7 @@ result_df.to_csv("tagged_data.csv", index=False)
 
 ### Класс `OllamaLLM`
 
-Класс для работы с LLM через Ollama.
+Класс для работы с LLM через Ollama (локальные модели).
 
 ```python
 from llm_tags import OllamaLLM
@@ -88,6 +89,50 @@ llm = OllamaLLM(
     temperature=0.7                         # Температура генерации
 )
 ```
+
+### Класс `OpenAICompatibleLLM`
+
+Класс для работы с OpenAI-совместимыми API (OpenAI, vLLM, LM Studio и др.).
+
+```python
+from llm_tags import OpenAICompatibleLLM
+
+# Пример с OpenAI API
+llm = OpenAICompatibleLLM(
+    api_url="https://api.openai.com/v1",
+    model="gpt-4",
+    api_key="your-api-key-here",
+    temperature=0.7,
+    max_tokens=4096,
+    top_p=1.0,
+    frequency_penalty=0.0,
+    presence_penalty=0.0
+)
+
+# Пример с vLLM (локальный сервер)
+llm = OpenAICompatibleLLM(
+    api_url="http://localhost:8000/v1",
+    model="meta-llama/Llama-2-7b-chat-hf",
+    temperature=0.7
+)
+
+# Пример с LM Studio
+llm = OpenAICompatibleLLM(
+    api_url="http://localhost:1234/v1",
+    model="local-model",
+    temperature=0.7
+)
+```
+
+**Параметры:**
+- `api_url` - URL API (обязательный)
+- `model` - название модели (обязательный)
+- `api_key` - API ключ (опционально, для OpenAI)
+- `temperature` - температура генерации (0.0-2.0, по умолчанию 0.7)
+- `max_tokens` - максимум токенов в ответе (по умолчанию 4096)
+- `top_p` - nucleus sampling (0.0-1.0, по умолчанию 1.0)
+- `frequency_penalty` - штраф за повторения (0.0-2.0, по умолчанию 0.0)
+- `presence_penalty` - штраф за присутствие токенов (0.0-2.0, по умолчанию 0.0)
 
 #### Метод `tag_batch`
 
@@ -108,10 +153,9 @@ results = llm.tag_batch(
 from llm_tags import TaggingPipeline
 
 pipeline = TaggingPipeline(
-    llm=None,              # Экземпляр OllamaLLM (если None, создается по умолчанию)
+    llm=None,              # Экземпляр OllamaLLM или OpenAICompatibleLLM (если None, создается OllamaLLM по умолчанию)
     batch_size=50,         # Размер батча (30-100 рекомендуется)
-    num_workers=5,         # Количество параллельных потоков
-    cache_dir="./cache"    # Директория для кеша
+    num_workers=5          # Количество параллельных потоков
 )
 ```
 
@@ -228,7 +272,7 @@ result_df, tags_dict = pipeline.tag(df, text_column="text", tag_prompt=prompt)
 result_df.to_csv("tagged_data.csv", index=False)
 ```
 
-### Пример 5: Кастомные настройки
+### Пример 5: Кастомные настройки (Ollama)
 
 ```python
 from llm_tags import TaggingPipeline, OllamaLLM
@@ -244,8 +288,7 @@ custom_llm = OllamaLLM(
 pipeline = TaggingPipeline(
     llm=custom_llm,
     batch_size=30,      # Меньший батч
-    num_workers=3,      # Меньше параллельных запросов
-    cache_dir="./my_cache"
+    num_workers=3       # Меньше параллельных запросов
 )
 
 result_df, tags_dict = pipeline.tag(
@@ -253,6 +296,83 @@ result_df, tags_dict = pipeline.tag(
     text_column="text",
     tag_prompt=prompt,
     max_tags=3  # Максимум 3 тега
+)
+```
+
+### Пример 6: Использование OpenAI API
+
+```python
+from llm_tags import TaggingPipeline, OpenAICompatibleLLM
+
+# OpenAI LLM
+openai_llm = OpenAICompatibleLLM(
+    api_url="https://api.openai.com/v1",
+    model="gpt-4",
+    api_key="your-api-key-here",
+    temperature=0.7,
+    max_tokens=4096
+)
+
+# Pipeline с OpenAI
+pipeline = TaggingPipeline(llm=openai_llm)
+
+result_df, tags_dict = pipeline.tag(
+    df,
+    text_column="text",
+    tag_prompt=prompt
+)
+```
+
+### Пример 7: Использование vLLM (локальный сервер)
+
+```python
+from llm_tags import TaggingPipeline, OpenAICompatibleLLM
+
+# Запустите vLLM сервер:
+# python -m vllm.entrypoints.openai.api_server \
+#     --model meta-llama/Llama-2-7b-chat-hf \
+#     --port 8000
+
+# vLLM LLM
+vllm_llm = OpenAICompatibleLLM(
+    api_url="http://localhost:8000/v1",
+    model="meta-llama/Llama-2-7b-chat-hf",
+    temperature=0.7
+)
+
+# Pipeline с vLLM
+pipeline = TaggingPipeline(llm=vllm_llm)
+
+result_df, tags_dict = pipeline.tag(
+    df,
+    text_column="text",
+    tag_prompt=prompt
+)
+```
+
+### Пример 8: Использование LM Studio
+
+```python
+from llm_tags import TaggingPipeline, OpenAICompatibleLLM
+
+# 1. Запустите LM Studio
+# 2. Загрузите модель
+# 3. Включите локальный сервер (порт 1234)
+
+# LM Studio LLM
+lmstudio_llm = OpenAICompatibleLLM(
+    api_url="http://localhost:1234/v1",
+    model="local-model",
+    temperature=0.7
+)
+
+# Pipeline с LM Studio
+pipeline = TaggingPipeline(llm=lmstudio_llm)
+
+result_df, tags_dict = pipeline.tag(
+    df,
+    text_column="text",
+    tag_prompt=prompt
 )
 ```
 
@@ -393,12 +513,18 @@ ConnectionError: Не удалось подключиться к Ollama
 
 ## 📝 Примеры
 
-Полные примеры использования см. в файле [`example.py`](example.py).
+Полные примеры использования см. в файлах:
+- [`example.py`](example.py) - примеры с Ollama
+- [`openai_example.py`](openai_example.py) - примеры с OpenAI-совместимыми API
 
 Запуск примеров:
 
 ```bash
+# Примеры с Ollama
 python example.py
+
+# Примеры с OpenAI API
+python openai_example.py
 ```
 
 ## 🤝 Вклад

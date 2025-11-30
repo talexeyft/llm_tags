@@ -316,11 +316,12 @@ if __name__ == "__main__":
     
     try:
         # Запускаем примеры
+        result5, tags5 = example_load_from_file()
         result1, tags1 = example_basic()
         result2, tags2 = example_with_existing_tags(tags1)
         result3, tags3 = example_skip_tagged()
         result4, tags4 = example_retag_with_limit()
-        result5, tags5 = example_load_from_file()
+        #result5, tags5 = example_load_from_file()
         # result6, tags6 = example_custom_ollama()  # Раскомментируйте если нужно
         
         print("\n" + "=" * 80)
