@@ -17,6 +17,8 @@ from typing import Optional
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
+import re
+from difflib import SequenceMatcher
 
 from prompt_builder import build_tagging_prompt
 from batch_processor import normalize_requests, parse_llm_response
@@ -895,6 +897,306 @@ class TaggingPipeline:
             'correlation': correlation_matrix,
             'top_pairs': top_pairs_df
         }
+    
+    def merge_similar_tags(
+        self,
+        df: pd.DataFrame,
+        tags_dict: dict[str, str],
+        tags_column: str = "tags",
+        min_frequency: int = 5,
+        similarity_threshold: float = 0.7,
+        use_llm_for_similarity: bool = True,
+        merge_rare_to_common: bool = True
+    ) -> tuple[pd.DataFrame, dict[str, str], dict[str, str]]:
+        """
+        Схлопывает редкие и похожие теги в единые, расширяя описание и имя тега.
+        
+        Логика работы:
+        1. Находит редкие теги (частота < min_frequency)
+        2. Находит похожие теги (семантически или по названию)
+        3. Объединяет их в единые теги с расширенным описанием
+        4. Обновляет DataFrame и словарь тегов
+        
+        Args:
+            df: DataFrame с колонкой tags
+            tags_dict: Словарь тегов {tag_name: description}
+            tags_column: Название колонки с тегами (по умолчанию "tags")
+            min_frequency: Минимальная частота тега, ниже которой он считается редким
+            similarity_threshold: Порог схожести для объединения тегов (0.0-1.0)
+            use_llm_for_similarity: Использовать LLM для определения похожих тегов (True)
+                                    или только строковое сравнение (False)
+            merge_rare_to_common: Объединять редкие теги с похожими частыми (True)
+                                  или только объединять похожие теги независимо от частоты (False)
+        
+        Returns:
+            Кортеж (обновленный DataFrame, обновленный словарь тегов, маппинг старых->новых тегов)
+            Формат маппинга: {old_tag: new_tag}
+        """
+        result_df = df.copy()
+        
+        # 1. Получаем статистику по тегам
+        analysis = self.analyze_tags(result_df, tags_column=tags_column)
+        tag_stats = analysis['statistics']
+        
+        if len(tag_stats) == 0:
+            return result_df, tags_dict, {}
+        
+        # 2. Определяем редкие теги
+        rare_tags = set(tag_stats[tag_stats['count'] < min_frequency]['tag'].tolist())
+        common_tags = set(tag_stats[tag_stats['count'] >= min_frequency]['tag'].tolist())
+        
+        print(f"Редких тегов (< {min_frequency}): {len(rare_tags)}")
+        print(f"Частых тегов (>= {min_frequency}): {len(common_tags)}")
+        
+        # 3. Создаем маппинг для объединения тегов
+        tag_mapping = {}  # {old_tag: new_tag}
+        merged_tags_info = {}  # {new_tag: {'description': ..., 'merged_from': [tags]}}
+        
+        # 4. Функция для вычисления схожести названий
+        def name_similarity(tag1: str, tag2: str) -> float:
+            """Вычисляет схожесть названий тегов"""
+            # Нормализуем названия (убираем пробелы, нижний регистр)
+            norm1 = re.sub(r'[_\s]+', '_', tag1.lower().strip())
+            norm2 = re.sub(r'[_\s]+', '_', tag2.lower().strip())
+            
+            # Проверяем точное совпадение после нормализации
+            if norm1 == norm2:
+                return 1.0
+            
+            # Проверяем вхождение одного в другое
+            if norm1 in norm2 or norm2 in norm1:
+                return 0.9
+            
+            # Используем SequenceMatcher для схожести
+            return SequenceMatcher(None, norm1, norm2).ratio()
+        
+        # 5. Функция для определения похожих тегов через LLM
+        def find_similar_tags_llm(tag: str, tag_description: str, candidate_tags: list[str]) -> Optional[str]:
+            """Использует LLM для поиска похожего тега среди кандидатов"""
+            if not candidate_tags:
+                return None
+            
+            # Формируем промпт для LLM
+            candidates_text = "\n".join([
+                f"- {cand}: {tags_dict.get(cand, 'нет описания')}"
+                for cand in candidate_tags
+            ])
+            
+            prompt = f"""Проанализируй тег и найди наиболее похожий тег из списка кандидатов.
+
+Текущий тег:
+Название: {tag}
+Описание: {tag_description}
+
+Кандидаты для сравнения:
+{candidates_text}
+
+Верни ТОЛЬКО название наиболее похожего тега из списка кандидатов, или "НЕТ" если похожего нет.
+Если теги семантически похожи (описывают одну и ту же проблему/категорию), верни название кандидата.
+Если теги разные, верни "НЕТ".
+
+Ответ (только название тега или "НЕТ"):"""
+            
+            try:
+                # Определяем формат запроса в зависимости от типа LLM
+                if hasattr(self.llm, 'api_key') or 'openai' in str(type(self.llm)).lower() or 'lmstudio' in str(type(self.llm)).lower():
+                    # OpenAI-совместимый API
+                    payload = {
+                        "model": self.llm.model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.3,
+                        "max_tokens": 50
+                    }
+                    response = self.llm._make_request("chat/completions", payload)
+                else:
+                    # Ollama API
+                    payload = {
+                        "model": self.llm.model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": False,
+                        "format": "json",
+                        "options": {
+                            "temperature": 0.3,
+                            "num_predict": 50,
+                        },
+                    }
+                    response = self.llm._make_request("chat", payload)
+                
+                content = self.llm._extract_content(response).strip()
+                
+                # Парсим ответ
+                content = content.strip().strip('"').strip("'")
+                if content.upper() == "НЕТ" or content.upper() == "NO":
+                    return None
+                
+                # Проверяем, что ответ - это один из кандидатов
+                for cand in candidate_tags:
+                    if cand.lower() in content.lower() or content.lower() in cand.lower():
+                        return cand
+                
+                return None
+            except Exception as e:
+                print(f"Ошибка при LLM сравнении для тега {tag}: {e}")
+                return None
+        
+        # 6. Обрабатываем редкие теги (объединяем с частыми похожими)
+        if merge_rare_to_common and rare_tags:
+            print(f"\nОбработка {len(rare_tags)} редких тегов...")
+            
+            for rare_tag in tqdm(rare_tags, desc="Объединение редких тегов"):
+                if rare_tag in tag_mapping:
+                    continue  # Уже обработан
+                
+                rare_desc = tags_dict.get(rare_tag, "")
+                
+                # Ищем похожий частый тег
+                best_match = None
+                best_similarity = 0.0
+                
+                # Сначала проверяем строковую схожесть
+                for common_tag in common_tags:
+                    if common_tag in tag_mapping:
+                        continue  # Уже объединен
+                    
+                    similarity = name_similarity(rare_tag, common_tag)
+                    if similarity > best_similarity and similarity >= similarity_threshold:
+                        best_similarity = similarity
+                        best_match = common_tag
+                
+                # Если не нашли по строке и используем LLM
+                if not best_match and use_llm_for_similarity:
+                    candidate_common_tags = [t for t in common_tags if t not in tag_mapping]
+                    if candidate_common_tags:
+                        best_match = find_similar_tags_llm(
+                            rare_tag, 
+                            rare_desc, 
+                            candidate_common_tags[:20]  # Ограничиваем для производительности
+                        )
+                        if best_match:
+                            best_similarity = 0.8  # Доверяем LLM
+                
+                if best_match:
+                    # Объединяем редкий тег с частым
+                    tag_mapping[rare_tag] = best_match
+                    
+                    # Расширяем описание частого тега
+                    if best_match not in merged_tags_info:
+                        merged_tags_info[best_match] = {
+                            'description': tags_dict.get(best_match, ""),
+                            'merged_from': [best_match]
+                        }
+                    
+                    merged_tags_info[best_match]['merged_from'].append(rare_tag)
+                    # Добавляем информацию из редкого тега в описание
+                    if rare_desc:
+                        if merged_tags_info[best_match]['description']:
+                            merged_tags_info[best_match]['description'] += f"; также включает: {rare_desc}"
+                        else:
+                            merged_tags_info[best_match]['description'] = rare_desc
+        
+        # 7. Обрабатываем похожие теги среди всех (независимо от частоты)
+        print(f"\nПоиск похожих тегов среди всех...")
+        all_tags = set(tag_stats['tag'].tolist())
+        processed_tags = set()
+        
+        for tag1 in tqdm(all_tags, desc="Объединение похожих тегов"):
+            if tag1 in tag_mapping or tag1 in processed_tags:
+                continue
+            
+            tag1_desc = tags_dict.get(tag1, "")
+            similar_tags = []
+            
+            # Ищем похожие теги
+            for tag2 in all_tags:
+                if tag2 == tag1 or tag2 in tag_mapping or tag2 in processed_tags:
+                    continue
+                
+                similarity = name_similarity(tag1, tag2)
+                if similarity >= similarity_threshold:
+                    similar_tags.append((tag2, similarity))
+            
+            # Если используем LLM, проверяем семантическую схожесть
+            if use_llm_for_similarity and not similar_tags:
+                candidates = [t for t in all_tags if t != tag1 and t not in tag_mapping and t not in processed_tags]
+                if candidates:
+                    similar_tag = find_similar_tags_llm(tag1, tag1_desc, candidates[:10])  # Ограничиваем кандидатов
+                    if similar_tag:
+                        similar_tags.append((similar_tag, 0.8))
+            
+            if similar_tags:
+                # Выбираем тег с наибольшей частотой как основной
+                similar_tags_with_freq = []
+                for tag, sim in similar_tags:
+                    tag_row = tag_stats[tag_stats['tag'] == tag]
+                    freq = tag_row['count'].iloc[0] if len(tag_row) > 0 else 0
+                    similar_tags_with_freq.append((tag, sim, freq))
+                
+                tag1_row = tag_stats[tag_stats['tag'] == tag1]
+                tag1_freq = tag1_row['count'].iloc[0] if len(tag1_row) > 0 else 0
+                similar_tags_with_freq.append((tag1, 1.0, tag1_freq))
+                
+                # Сортируем по частоте (убывание), затем по схожести
+                similar_tags_with_freq.sort(key=lambda x: (x[2], x[1]), reverse=True)
+                main_tag = similar_tags_with_freq[0][0]
+                
+                # Объединяем все похожие теги в основной
+                if main_tag not in merged_tags_info:
+                    merged_tags_info[main_tag] = {
+                        'description': tags_dict.get(main_tag, ""),
+                        'merged_from': [main_tag]
+                    }
+                
+                for other_tag, _, _ in similar_tags_with_freq[1:]:
+                    tag_mapping[other_tag] = main_tag
+                    merged_tags_info[main_tag]['merged_from'].append(other_tag)
+                    
+                    other_desc = tags_dict.get(other_tag, "")
+                    if other_desc:
+                        if merged_tags_info[main_tag]['description']:
+                            merged_tags_info[main_tag]['description'] += f"; также включает: {other_desc}"
+                        else:
+                            merged_tags_info[main_tag]['description'] = other_desc
+                
+                processed_tags.add(main_tag)
+                processed_tags.update([tag for tag, _, _ in similar_tags_with_freq[1:]])
+        
+        # 8. Обновляем словарь тегов
+        updated_tags_dict = {}
+        for tag, desc in tags_dict.items():
+            if tag not in tag_mapping:
+                # Тег не объединен, оставляем как есть или обновляем если был расширен
+                if tag in merged_tags_info:
+                    updated_tags_dict[tag] = merged_tags_info[tag]['description']
+                else:
+                    updated_tags_dict[tag] = desc
+        
+        # Добавляем только основные теги из объединенных
+        for main_tag, info in merged_tags_info.items():
+            if main_tag not in tag_mapping:  # Это основной тег, не объединенный в другой
+                updated_tags_dict[main_tag] = info['description']
+        
+        # 9. Обновляем DataFrame - заменяем старые теги на новые
+        def replace_tags(tags_str):
+            """Заменяет теги в строке согласно маппингу"""
+            if pd.isna(tags_str) or not tags_str or str(tags_str).strip() == "":
+                return ""
+            
+            tags_list = [t.strip() for t in str(tags_str).split(",") if t.strip()]
+            updated_tags = []
+            for tag in tags_list:
+                new_tag = tag_mapping.get(tag, tag)
+                if new_tag not in updated_tags:  # Убираем дубликаты
+                    updated_tags.append(new_tag)
+            
+            return ", ".join(updated_tags) if updated_tags else ""
+        
+        result_df[tags_column] = result_df[tags_column].apply(replace_tags)
+        
+        print(f"\n✓ Объединение завершено:")
+        print(f"  Объединено тегов: {len(tag_mapping)}")
+        print(f"  Итоговое количество тегов: {len(updated_tags_dict)} (было {len(tags_dict)})")
+        
+        return result_df, updated_tags_dict, tag_mapping
 
 
 # Пример использования (для тестирования)

@@ -17,9 +17,9 @@ from lmstudio_llm import LMStudioLLM
 # Глобальная LLM модель для всех примеров (LM Studio)
 LLM = LMStudioLLM(
     api_url="http://192.168.1.26:1234/v1",
-    model="qwen/qwen3-32b",
+    model="qwen3-30b-a3b-instruct-2507",
     temperature=0.7,
-    max_tokens=8192,
+    max_tokens=8192*2,
     timeout=600,
     disable_thinking=True   
 )
@@ -108,7 +108,39 @@ def example_load_from_file():
     corr_matrix = analysis['correlation']
     print(corr_matrix.iloc[:10, :10])
     
-    return result_df, tags_dict, expanded_df, analysis
+    # 3. Объединение редких и похожих тегов
+    print("\n" + "=" * 80)
+    print("ОБЪЕДИНЕНИЕ РЕДКИХ И ПОХОЖИХ ТЕГОВ")
+    print("=" * 80)
+    
+    print(f"\nДо объединения: {len(tags_dict)} тегов")
+    print(f"Примеры редких тегов (частота < 5):")
+    rare_tags_stats = analysis['statistics'][analysis['statistics']['count'] < 5]
+    if len(rare_tags_stats) > 0:
+        print(rare_tags_stats.head(10))
+    
+    # Объединяем теги
+    merged_df, merged_tags_dict, tag_mapping = pipeline.merge_similar_tags(
+        result_df,
+        tags_dict,
+        tags_column="tags",
+        min_frequency=5,  # Теги с частотой < 5 считаются редкими
+        similarity_threshold=0.7,  # Порог схожести для объединения
+        use_llm_for_similarity=True,  # Использовать LLM для семантического сравнения
+        merge_rare_to_common=True  # Объединять редкие с частыми
+    )
+    
+    print(f"\nПосле объединения: {len(merged_tags_dict)} тегов")
+    print(f"\nПримеры объединений (первые 10):")
+    for i, (old_tag, new_tag) in enumerate(list(tag_mapping.items())[:10]):
+        print(f"  {old_tag} -> {new_tag}")
+    
+    # Показываем статистику после объединения
+    merged_analysis = pipeline.analyze_tags(merged_df, tags_column="tags")
+    print(f"\n--- Статистика по тегам после объединения (топ-20) ---")
+    print(merged_analysis['statistics'].head(20))
+    
+    return result_df, tags_dict, expanded_df, analysis, merged_df, merged_tags_dict, tag_mapping
 
 
 
@@ -123,7 +155,7 @@ if __name__ == "__main__":
     
     try:
         # Запускаем примеры
-        result5, tags5, expanded_df, analysis = example_load_from_file()
+        result5, tags5, expanded_df, analysis, merged_df, merged_tags_dict, tag_mapping = example_load_from_file()
 
         #result5, tags5 = example_load_from_file()
         # result6, tags6 = example_custom_ollama()  # Раскомментируйте если нужно
@@ -131,6 +163,10 @@ if __name__ == "__main__":
         print("\n" + "=" * 80)
         print("ВСЕ ПРИМЕРЫ УСПЕШНО ВЫПОЛНЕНЫ!")
         print("=" * 80)
+        print(f"\nИтоговая статистика:")
+        print(f"  Исходных тегов: {len(tags5)}")
+        print(f"  После объединения: {len(merged_tags_dict)}")
+        print(f"  Объединено тегов: {len(tag_mapping)}")
         
     except Exception as e:
         print(f"\nОшибка: {e}")
