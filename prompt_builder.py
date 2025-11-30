@@ -13,7 +13,8 @@ def build_tagging_prompt(
     base_prompt: str,
     requests: list[tuple[str, str]],
     existing_tags: Optional[dict[str, str]] = None,
-    max_tags: int = 5
+    max_tags: int = 5,
+    allow_new_tags: bool = True
 ) -> str:
     """
     Построить полный промпт для тегирования батча обращений.
@@ -23,6 +24,7 @@ def build_tagging_prompt(
         requests: Список обращений в формате [(id, text), ...]
         existing_tags: Существующие теги {tag_name: description}
         max_tags: Максимальное количество тегов на обращение
+        allow_new_tags: Разрешить создание новых тегов (по умолчанию True)
         
     Returns:
         Полный промпт для отправки в LLM
@@ -30,7 +32,10 @@ def build_tagging_prompt(
     # Формируем промпт с существующими тегами
     existing_tags_text = ""
     if existing_tags:
-        existing_tags_text = "\n\nСуществующие теги (используй их если подходят):\n"
+        if allow_new_tags:
+            existing_tags_text = "\n\nСуществующие теги (используй их если подходят):\n"
+        else:
+            existing_tags_text = "\n\nСуществующие теги (используй ТОЛЬКО их, не создавай новых):\n"
         for tag_name, description in existing_tags.items():
             existing_tags_text += f"- {tag_name}: {description}\n"
     
@@ -65,7 +70,7 @@ def build_tagging_prompt(
 - В поле "new_tags" должны быть ТОЛЬКО новые теги, которых нет в списке существующих тегов
 - Максимум {max_tags} тегов на обращение
 - Если тег определить невозможно, верни пустой массив tags: {{"id": "id1", "tags": []}}
-- Ты должна создавать новые теги, если существующие не подходят
+{f"- НЕ создавай новые теги! Используй ТОЛЬКО теги из списка существующих тегов. Если подходящего тега нет, верни пустой массив tags." if not allow_new_tags else "- Ты должна создавать новые теги, если существующие не подходят"}
 - Формируй теги на русском языке, используя только русские слова, без спецсимволов и без чисел
 - В тегах пробел заменяй на нижнее подчеркивание, как и любые другие спецсимволы
 - Старайся покрывать не менее 30% обращений

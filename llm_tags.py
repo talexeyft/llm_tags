@@ -127,7 +127,8 @@ class OllamaLLM:
         requests: list[tuple[str, str]] | list[dict],
         prompt: str,
         existing_tags: Optional[dict[str, str]] = None,
-        max_tags: int = 5
+        max_tags: int = 5,
+        allow_new_tags: bool = True
     ) -> tuple[list[dict], dict[str, str]]:
         """
         Тегировать батч обращений.
@@ -137,6 +138,7 @@ class OllamaLLM:
             prompt: Промпт с инструкциями по тегированию
             existing_tags: Существующие теги {tag_name: description}
             max_tags: Максимальное количество тегов на обращение
+            allow_new_tags: Разрешить создание новых тегов (по умолчанию True)
             
         Returns:
             Кортеж (список результатов с id и тегами, словарь новых тегов)
@@ -153,7 +155,8 @@ class OllamaLLM:
             base_prompt=prompt,
             requests=normalized_requests,
             existing_tags=existing_tags,
-            max_tags=max_tags
+            max_tags=max_tags,
+            allow_new_tags=allow_new_tags
         )
         
         # Запрос к LLM (специфичный для Ollama)
@@ -308,7 +311,8 @@ class OpenAICompatibleLLM:
         requests: list[tuple[str, str]] | list[dict],
         prompt: str,
         existing_tags: Optional[dict[str, str]] = None,
-        max_tags: int = 5
+        max_tags: int = 5,
+        allow_new_tags: bool = True
     ) -> tuple[list[dict], dict[str, str]]:
         """
         Тегировать батч обращений.
@@ -318,6 +322,7 @@ class OpenAICompatibleLLM:
             prompt: Промпт с инструкциями по тегированию
             existing_tags: Существующие теги {tag_name: description}
             max_tags: Максимальное количество тегов на обращение
+            allow_new_tags: Разрешить создание новых тегов (по умолчанию True)
             
         Returns:
             Кортеж (список результатов с id и тегами, словарь новых тегов)
@@ -334,7 +339,8 @@ class OpenAICompatibleLLM:
             base_prompt=prompt,
             requests=normalized_requests,
             existing_tags=existing_tags,
-            max_tags=max_tags
+            max_tags=max_tags,
+            allow_new_tags=allow_new_tags
         )
         
         # Запрос к LLM (специфичный для OpenAI API)
@@ -406,7 +412,8 @@ class TaggingPipeline:
         id_column: Optional[str],
         tag_prompt: str,
         existing_tags: Optional[dict[str, str]],
-        max_tags: int
+        max_tags: int,
+        allow_new_tags: bool = True
     ) -> tuple[dict[str, str], dict[str, str]]:
         """
         Обработать один батч обращений.
@@ -418,6 +425,7 @@ class TaggingPipeline:
             tag_prompt: Промпт для тегирования
             existing_tags: Существующие теги
             max_tags: Максимальное количество тегов
+            allow_new_tags: Разрешить добавление новых тегов (по умолчанию True)
             
         Returns:
             Кортеж (словарь {id: tags_string}, обновленный словарь тегов с новыми тегами)
@@ -441,15 +449,17 @@ class TaggingPipeline:
             requests=requests_with_ids,
             prompt=tag_prompt,
             existing_tags=existing_tags,
-            max_tags=max_tags
+            max_tags=max_tags,
+            allow_new_tags=allow_new_tags
         )
         
         # Формируем результаты: словарь {id: tags_string}
         tags_dict = {}
         updated_tags_dict = existing_tags.copy() if existing_tags else {}
         
-        # Добавляем новые теги в словарь
-        updated_tags_dict.update(new_tags)
+        # Добавляем новые теги в словарь только если разрешено
+        if allow_new_tags:
+            updated_tags_dict.update(new_tags)
         
         # Обрабатываем результаты от LLM
         for result in results:
@@ -476,7 +486,8 @@ class TaggingPipeline:
         skip_if_tags_count: int = 10,
         max_tags: int = 5,
         num_workers: int = 1,
-        batch_size: int = 50
+        batch_size: int = 50,
+        allow_new_tags: bool = True
     ) -> tuple[pd.DataFrame, dict[str, str]]:
         """
         Тегировать обращения в DataFrame.
@@ -490,6 +501,8 @@ class TaggingPipeline:
             skip_if_tags_count: Пропустить строки с количеством тегов >= этого значения
             max_tags: Максимальное количество тегов на обращение
             num_workers: Количество параллельных потоков (по умолчанию None, используется self.num_workers)
+            batch_size: Размер батча для обработки (по умолчанию 50)
+            allow_new_tags: Разрешить добавление новых тегов в словарь (по умолчанию True)
             
         Returns:
             Кортеж (DataFrame с колонкой tags, словарь тегов {tag_name: description})
@@ -550,7 +563,8 @@ class TaggingPipeline:
                             id_column,
                             tag_prompt,
                             tags_dict,  # Передаем текущий словарь тегов
-                            max_tags
+                            max_tags,
+                            allow_new_tags
                         )
                         
                         # Определяем новые теги до обновления tags_dict
@@ -604,7 +618,8 @@ class TaggingPipeline:
                         id_column,
                         tag_prompt,
                         current_tags,  # Каждый батч получает актуальный словарь тегов
-                        max_tags
+                        max_tags,
+                        allow_new_tags
                     )
                 
                 # Запускаем первые num_workers батчей
@@ -722,25 +737,36 @@ class TaggingPipeline:
         if tags_column not in result_df.columns:
             raise ValueError(f"Колонка '{tags_column}' не найдена в DataFrame")
         
+        # Парсим теги один раз для всех строк и собираем уникальные теги
+        def parse_tags(tags_str):
+            """Парсит строку тегов и возвращает множество тегов"""
+            if pd.notna(tags_str) and tags_str and str(tags_str).strip():
+                return set(t.strip() for t in str(tags_str).split(",") if t.strip())
+            return set()
+        
+        # Парсим теги один раз для всех строк
+        tags_sets = result_df[tags_column].apply(parse_tags)
+        
         # Собираем все уникальные теги
         all_tags = set()
-        for tags_str in result_df[tags_column]:
-            if pd.notna(tags_str) and tags_str and str(tags_str).strip():
-                tags_list = [t.strip() for t in str(tags_str).split(",") if t.strip()]
-                all_tags.update(tags_list)
+        for tag_set in tags_sets:
+            all_tags.update(tag_set)
         
-        # Создаем столбцы для каждого тега
+        # Нормализуем имена тегов для столбцов заранее
+        tag_to_column = {}
         for tag in all_tags:
-            # Нормализуем имя тега для столбца: заменяем пробелы и спецсимволы на подчеркивания
             tag_normalized = tag.replace(" ", "_").replace("/", "_").replace("\\", "_")
             tag_normalized = "".join(c if c.isalnum() or c == "_" else "_" for c in tag_normalized)
-            column_name = f"tag_{tag_normalized}"
+            tag_to_column[tag] = f"tag_{tag_normalized}"
+        
+        # Создаем все столбцы сразу, используя векторизованные операции
+        new_columns = {}
+        for tag, column_name in tag_to_column.items():
+            new_columns[column_name] = tags_sets.apply(lambda tag_set: tag in tag_set)
+        
+        # Добавляем все столбцы одним присваиванием
+        result_df = result_df.assign(**new_columns)
             
-            # Проверяем наличие тега в каждой строке
-            result_df[column_name] = result_df[tags_column].apply(
-                lambda x: tag in [t.strip() for t in str(x).split(",") if t.strip()] 
-                if pd.notna(x) and x and str(x).strip() else False
-            ).astype(bool)
         
         print(f"Создано {len(all_tags)} столбцов для тегов")
         
