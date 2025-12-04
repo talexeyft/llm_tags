@@ -363,7 +363,10 @@ from llm_tags import TaggingPipeline, OpenAICompatibleLLM
 lmstudio_llm = OpenAICompatibleLLM(
     api_url="http://localhost:1234/v1",
     model="local-model",
-    temperature=0.7
+    temperature=0.7,
+    timeout=600,
+    disable_thinking=True,  # Отключить размышления для некоторых моделей
+    use_response_format=False  # LM Studio может не поддерживать response_format
 )
 
 # Pipeline с LM Studio

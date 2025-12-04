@@ -10,18 +10,18 @@
 """
 
 import pandas as pd
-from llm_tags import TaggingPipeline
-from lmstudio_llm import LMStudioLLM
+from llm_tags import TaggingPipeline, OpenAICompatibleLLM
 
 
 # Глобальная LLM модель для всех примеров (LM Studio)
-LLM = LMStudioLLM(
+LLM = OpenAICompatibleLLM(
     api_url="http://192.168.1.26:1234/v1",
     model="qwen3-30b-a3b-instruct-2507",
     temperature=0.7,
     max_tokens=8192*2,
     timeout=600,
-    disable_thinking=True   
+    disable_thinking=True,
+    use_response_format=False  # LM Studio может не поддерживать response_format
 )
 
 

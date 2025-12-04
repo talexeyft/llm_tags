@@ -185,6 +185,7 @@ class OpenAICompatibleLLM:
     Класс для работы с OpenAI-совместимыми API (OpenAI, vLLM, LM Studio, etc).
     
     Поддерживает стандартный OpenAI API формат запросов.
+    Объединяет функциональность для работы с различными OpenAI-совместимыми сервисами.
     """
     
     def __init__(
@@ -194,31 +195,41 @@ class OpenAICompatibleLLM:
         api_key: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        timeout: int = 300,
         top_p: float = 1.0,
         frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0
+        presence_penalty: float = 0.0,
+        disable_thinking: bool = False,
+        use_response_format: bool = True
     ):
         """
         Инициализация OpenAI-совместимого LLM.
         
         Args:
-            api_url: URL API (например, "https://api.openai.com/v1" или "http://localhost:8000/v1")
-            model: Название модели (например, "gpt-4", "gpt-3.5-turbo")
+            api_url: URL API (например, "https://api.openai.com/v1" или "http://localhost:1234/v1")
+            model: Название модели (например, "gpt-4", "gpt-3.5-turbo", "local-model")
             api_key: API ключ (если требуется, по умолчанию None)
             temperature: Температура генерации (по умолчанию 0.7)
             max_tokens: Максимальное количество токенов в ответе (по умолчанию 4096)
+            timeout: Таймаут запроса в секундах (по умолчанию 300)
             top_p: Nucleus sampling параметр (по умолчанию 1.0)
             frequency_penalty: Штраф за частоту повторений (по умолчанию 0.0)
             presence_penalty: Штраф за присутствие токенов (по умолчанию 0.0)
+            disable_thinking: Если True, добавляет "/nothink" в системный промпт (для LM Studio)
+            use_response_format: Использовать response_format={"type": "json_object"} (по умолчанию True)
+                                 Некоторые сервисы (LM Studio) могут не поддерживать этот параметр
         """
         self.api_url = api_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.timeout = timeout
         self.top_p = top_p
         self.frequency_penalty = frequency_penalty
         self.presence_penalty = presence_penalty
+        self.disable_thinking = disable_thinking
+        self.use_response_format = use_response_format
         
     def _make_request(self, endpoint: str, payload: dict) -> dict:
         """
@@ -241,7 +252,12 @@ class OpenAICompatibleLLM:
             protocol = "http"
             url = url[7:]
         else:
-            protocol = "https"
+            protocol = "http"
+            # Если нет протокола, добавляем http://
+            if not url.startswith("http"):
+                url = f"http://{url}"
+                protocol = "http"
+                url = url[7:]
         
         host_port = url.split("/", 1)
         host = host_port[0]
@@ -258,14 +274,14 @@ class OpenAICompatibleLLM:
                 http = urllib3.PoolManager(
                     num_pools=1,
                     maxsize=1,
-                    timeout=urllib3.Timeout(connect=10, read=300),
+                    timeout=urllib3.Timeout(connect=10, read=self.timeout),
                     cert_reqs='CERT_NONE'
                 )
             else:
                 http = urllib3.PoolManager(
                     num_pools=1,
                     maxsize=1,
-                    timeout=urllib3.Timeout(connect=10, read=300)
+                    timeout=urllib3.Timeout(connect=10, read=self.timeout)
                 )
             
             headers = {
@@ -276,22 +292,35 @@ class OpenAICompatibleLLM:
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
             
+            full_url = f"{protocol}://{host}:{port}{path}"
+            
             response = http.request(
                 "POST",
-                f"{protocol}://{host}:{port}{path}",
+                full_url,
                 body=json.dumps(payload).encode("utf-8"),
                 headers=headers
             )
             
             if response.status != 200:
-                error_text = response.data.decode("utf-8")
+                error_text = response.data.decode("utf-8", errors='ignore')
+                print(f"[OpenAICompatible] Ошибка API: статус {response.status}")
+                print(f"[OpenAICompatible] Ответ: {error_text[:500]}")
                 raise ConnectionError(
-                    f"API error: {response.status}. Response: {error_text}"
+                    f"API error: {response.status}. Response: {error_text[:500]}"
                 )
             
-            return json.loads(response.data.decode("utf-8"))
+            response_data = json.loads(response.data.decode("utf-8"))
+            return response_data
             
+        except json.JSONDecodeError as e:
+            error_text = response.data.decode("utf-8", errors='ignore') if 'response' in locals() else "No response"
+            print(f"[OpenAICompatible] Ошибка парсинга JSON: {e}")
+            print(f"[OpenAICompatible] Ответ: {error_text[:500]}")
+            raise ConnectionError(
+                f"Не удалось распарсить ответ от API. Ошибка: {e}. Ответ: {error_text[:500]}"
+            )
         except Exception as e:
+            print(f"[OpenAICompatible] Общая ошибка: {e}")
             raise ConnectionError(
                 f"Не удалось подключиться к API на {self.api_url}. Ошибка: {e}"
             )
@@ -305,8 +334,17 @@ class OpenAICompatibleLLM:
             
         Returns:
             Текст контента
+            
+        Raises:
+            ValueError: Если формат ответа неожиданный
         """
-        return response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        if "choices" in response and len(response["choices"]) > 0:
+            content = response["choices"][0].get("message", {}).get("content", "").strip()
+            return content
+        else:
+            print(f"[OpenAICompatible] Неожиданный формат ответа: {list(response.keys())}")
+            print(f"[OpenAICompatible] Полный ответ: {json.dumps(response, indent=2, ensure_ascii=False)[:1000]}")
+            raise ValueError(f"Неожиданный формат ответа от API: {response}")
     
     def tag_batch(
         self,
@@ -314,7 +352,8 @@ class OpenAICompatibleLLM:
         prompt: str,
         existing_tags: Optional[dict[str, str]] = None,
         max_tags: int = 5,
-        allow_new_tags: bool = True
+        allow_new_tags: bool = True,
+        disable_thinking: Optional[bool] = None
     ) -> tuple[list[dict], dict[str, str]]:
         """
         Тегировать батч обращений.
@@ -325,6 +364,8 @@ class OpenAICompatibleLLM:
             existing_tags: Существующие теги {tag_name: description}
             max_tags: Максимальное количество тегов на обращение
             allow_new_tags: Разрешить создание новых тегов (по умолчанию True)
+            disable_thinking: Если True, добавляет "/nothink" в системный промпт для отключения размышлений.
+                             Если None, используется значение из конструктора.
             
         Returns:
             Кортеж (список результатов с id и тегами, словарь новых тегов)
@@ -345,17 +386,33 @@ class OpenAICompatibleLLM:
             allow_new_tags=allow_new_tags
         )
         
-        # Запрос к LLM (специфичный для OpenAI API)
+        # Используем значение из параметра или из конструктора
+        use_disable_thinking = disable_thinking if disable_thinking is not None else self.disable_thinking
+        
+        # Формируем сообщения
+        messages = []
+        
+        # Добавляем системное сообщение для отключения размышлений, если нужно
+        if use_disable_thinking:
+            messages.append({"role": "system", "content": "/nothink"})
+        
+        # Добавляем пользовательское сообщение с промптом
+        messages.append({"role": "user", "content": full_prompt})
+        
+        # Запрос к LLM (OpenAI API формат)
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": full_prompt}],
+            "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "top_p": self.top_p,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
-            "response_format": {"type": "json_object"}
         }
+        
+        # Добавляем response_format только если включено и поддерживается
+        if self.use_response_format:
+            payload["response_format"] = {"type": "json_object"}
         
         response = self._make_request("chat/completions", payload)
         content = self._extract_content(response)
@@ -1268,7 +1325,10 @@ if __name__ == "__main__":
     # lmstudio_llm = OpenAICompatibleLLM(
     #     api_url="http://localhost:1234/v1",
     #     model="local-model",
-    #     temperature=0.7
+    #     temperature=0.7,
+    #     timeout=600,
+    #     disable_thinking=True,
+    #     use_response_format=False
     # )
     
     # Создаем pipeline с OpenAI-совместимой моделью
